@@ -236,6 +236,7 @@ class BertSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
 
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
@@ -263,6 +264,7 @@ class BertSelfAttention(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_predropout_attentions=False,
     ):
         mixed_query_layer = self.query(hidden_states)
 
@@ -328,6 +330,10 @@ class BertSelfAttention(nn.Module):
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
 
+        if output_predropout_attentions:
+            assert self.attention_probs_dropout_prob > 0.0
+            predropout_attention_probs = attention_probs.clone()
+
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = self.dropout(attention_probs)
@@ -342,7 +348,12 @@ class BertSelfAttention(nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+        if output_predropout_attentions:
+            outputs = (context_layer, predropout_attention_probs)
+        elif output_attentions:
+            outputs = (context_layer, attention_probs)
+        else: 
+            outputs = (context_layer,)
 
         if self.is_decoder:
             outputs = outputs + (past_key_value,)
@@ -397,6 +408,7 @@ class BertAttention(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_predropout_attentions=False,
     ):
         self_outputs = self.self(
             hidden_states,
@@ -406,6 +418,7 @@ class BertAttention(nn.Module):
             encoder_attention_mask,
             past_key_value,
             output_attentions,
+            output_predropout_attentions,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -464,6 +477,7 @@ class BertLayer(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_predropout_attentions=False,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -472,6 +486,7 @@ class BertLayer(nn.Module):
             attention_mask,
             head_mask,
             output_attentions=output_attentions,
+            output_predropout_attentions=output_predropout_attentions,
             past_key_value=self_attn_past_key_value,
         )
         attention_output = self_attention_outputs[0]
@@ -540,6 +555,7 @@ class BertEncoder(nn.Module):
         past_key_values=None,
         use_cache=None,
         output_attentions=False,
+        output_predropout_attentions=False,
         output_hidden_states=False,
         return_dict=True,
     ):
@@ -587,6 +603,7 @@ class BertEncoder(nn.Module):
                     encoder_attention_mask,
                     past_key_value,
                     output_attentions,
+                    output_predropout_attentions,
                 )
 
             hidden_states = layer_outputs[0]
@@ -898,6 +915,7 @@ class BertModel(BertPreTrainedModel):
         past_key_values=None,
         use_cache=None,
         output_attentions=None,
+        output_predropout_attentions=None,
         output_hidden_states=None,
         return_dict=None,
     ):
@@ -922,6 +940,9 @@ class BertModel(BertPreTrainedModel):
             decoding (see :obj:`past_key_values`).
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_predropout_attentions = (
+            output_predropout_attentions if output_predropout_attentions is not None else self.config.output_predropout_attentions
+        )
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -997,6 +1018,7 @@ class BertModel(BertPreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            output_predropout_attentions=output_predropout_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
