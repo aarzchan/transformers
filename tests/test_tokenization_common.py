@@ -16,6 +16,7 @@
 
 import inspect
 import itertools
+import json
 import os
 import pickle
 import re
@@ -26,19 +27,23 @@ from collections import OrderedDict
 from itertools import takewhile
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
 
-from huggingface_hub import HfApi
+from huggingface_hub import delete_repo, login
 from requests.exceptions import HTTPError
 from transformers import (
+    AlbertTokenizer,
+    AlbertTokenizerFast,
     BertTokenizer,
+    BertTokenizerFast,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
     SpecialTokensMixin,
+    Trainer,
+    TrainingArguments,
     is_tf_available,
     is_torch_available,
 )
 from transformers.testing_utils import (
-    ENDPOINT_STAGING,
     PASS,
     USER,
     get_tests_dir,
@@ -49,7 +54,11 @@ from transformers.testing_utils import (
     require_torch,
     slow,
 )
-from transformers.tokenization_utils import AddedToken
+from transformers.tokenization_utils import AddedToken, Trie
+
+
+if is_torch_available():
+    import torch.nn as nn
 
 
 if TYPE_CHECKING:
@@ -299,6 +308,33 @@ class TokenizerTesterMixin:
             {value: batch_encode_plus_sequences[value][i] for value in batch_encode_plus_sequences.keys()}
             for i in range(len(batch_encode_plus_sequences["input_ids"]))
         ]
+
+    # TODO: this test can be combined with `test_sentencepiece_tokenize_and_convert_tokens_to_string` after the latter is extended to all tokenizers.
+    def test_tokenize_special_tokens(self):
+        """Test `tokenize` with special tokens."""
+        tokenizers = self.get_tokenizers(fast=True)
+        for tokenizer in tokenizers:
+            with self.subTest(f"{tokenizer.__class__.__name__}"):
+                SPECIAL_TOKEN_1 = "[SPECIAL_TOKEN_1]"
+                SPECIAL_TOKEN_2 = "[SPECIAL_TOKEN_2]"
+
+                # TODO:
+                # Can we combine `unique_no_split_tokens` and `all_special_tokens`(and properties related to it)
+                # with one variable(property) for a better maintainability?
+
+                # `add_tokens` method stores special tokens only in `tokenizer.unique_no_split_tokens`. (in tokenization_utils.py)
+                tokenizer.add_tokens([SPECIAL_TOKEN_1], special_tokens=True)
+                # `add_special_tokens` method stores special tokens in `tokenizer.additional_special_tokens`,
+                # which also occur in `tokenizer.all_special_tokens`. (in tokenization_utils_base.py)
+                tokenizer.add_special_tokens({"additional_special_tokens": [SPECIAL_TOKEN_2]})
+
+                token_1 = tokenizer.tokenize(SPECIAL_TOKEN_1)
+                token_2 = tokenizer.tokenize(SPECIAL_TOKEN_2)
+
+                self.assertEqual(len(token_1), 1)
+                self.assertEqual(len(token_2), 1)
+                self.assertEqual(token_1[0], SPECIAL_TOKEN_1)
+                self.assertEqual(token_2[0], SPECIAL_TOKEN_2)
 
     # TODO: this test could be extended to all tokenizers - not just the sentencepiece
     def test_sentencepiece_tokenize_and_convert_tokens_to_string(self):
@@ -931,6 +967,7 @@ class TokenizerTesterMixin:
                     self.assertEqual(truncated_sequence, sequence[:-2])
 
                     self.assertEqual(len(overflowing_tokens), 2 + stride)
+                    self.assertEqual(overflowing_tokens, sequence[-(2 + stride) :])
 
     def test_maximum_encoding_length_pair_input(self):
         tokenizers = self.get_tokenizers(do_lower_case=False, model_max_length=100)
@@ -1043,18 +1080,18 @@ class TokenizerTesterMixin:
                     overflow_first_sequence if len(seq0_tokens) > len(seq1_tokens) else overflow_second_sequence
                 )
 
-                information = tokenizer.encode_plus(
-                    seq_0,
-                    seq_1,
-                    max_length=len(sequence) - 2,
-                    add_special_tokens=False,
-                    stride=stride,
-                    truncation="longest_first",
-                    return_overflowing_tokens=True,
-                    # add_prefix_space=False,
-                )
                 # Overflowing tokens are handled quite differently in slow and fast tokenizers
                 if isinstance(tokenizer, PreTrainedTokenizerFast):
+                    information = tokenizer(
+                        seq_0,
+                        seq_1,
+                        max_length=len(sequence) - 2,
+                        add_special_tokens=False,
+                        stride=stride,
+                        truncation="longest_first",
+                        return_overflowing_tokens=True,
+                        # add_prefix_space=False,
+                    )
                     truncated_sequence = information["input_ids"][0]
                     overflowing_tokens = information["input_ids"][1]
                     self.assertEqual(len(information["input_ids"]), 2)
@@ -1065,28 +1102,39 @@ class TokenizerTesterMixin:
                     self.assertEqual(len(overflowing_tokens), 2 + stride + len(smallest))
                     self.assertEqual(overflowing_tokens, overflow_longest_sequence)
                 else:
-                    truncated_sequence = information["input_ids"]
-                    overflowing_tokens = information["overflowing_tokens"]
+                    # No overflowing tokens when using 'longest' in python tokenizers
+                    with self.assertRaises(ValueError) as context:
+                        information = tokenizer(
+                            seq_0,
+                            seq_1,
+                            max_length=len(sequence) - 2,
+                            add_special_tokens=False,
+                            stride=stride,
+                            truncation="longest_first",
+                            return_overflowing_tokens=True,
+                            # add_prefix_space=False,
+                        )
 
-                    self.assertEqual(len(truncated_sequence), len(sequence) - 2)
-                    self.assertEqual(truncated_sequence, truncated_longest_sequence)
+                    self.assertTrue(
+                        context.exception.args[0].startswith(
+                            "Not possible to return overflowing tokens for pair of sequences with the "
+                            "`longest_first`. Please select another truncation strategy than `longest_first`, "
+                            "for instance `only_second` or `only_first`."
+                        )
+                    )
 
-                    self.assertEqual(
-                        len(overflowing_tokens), 2 + stride
-                    )  # No overflowing tokens when using 'longest' in python tokenizers
-
-                information = tokenizer.encode_plus(
-                    seq_0,
-                    seq_1,
-                    max_length=len(sequence) - 2,
-                    add_special_tokens=False,
-                    stride=stride,
-                    truncation=True,
-                    return_overflowing_tokens=True,
-                    # add_prefix_space=False,
-                )
                 # Overflowing tokens are handled quite differently in slow and fast tokenizers
                 if isinstance(tokenizer, PreTrainedTokenizerFast):
+                    information = tokenizer(
+                        seq_0,
+                        seq_1,
+                        max_length=len(sequence) - 2,
+                        add_special_tokens=False,
+                        stride=stride,
+                        truncation=True,
+                        return_overflowing_tokens=True,
+                        # add_prefix_space=False,
+                    )
                     truncated_sequence = information["input_ids"][0]
                     overflowing_tokens = information["input_ids"][1]
                     self.assertEqual(len(information["input_ids"]), 2)
@@ -1097,17 +1145,28 @@ class TokenizerTesterMixin:
                     self.assertEqual(len(overflowing_tokens), 2 + stride + len(smallest))
                     self.assertEqual(overflowing_tokens, overflow_longest_sequence)
                 else:
-                    truncated_sequence = information["input_ids"]
-                    overflowing_tokens = information["overflowing_tokens"]
+                    # No overflowing tokens when using 'longest' in python tokenizers
+                    with self.assertRaises(ValueError) as context:
+                        information = tokenizer(
+                            seq_0,
+                            seq_1,
+                            max_length=len(sequence) - 2,
+                            add_special_tokens=False,
+                            stride=stride,
+                            truncation=True,
+                            return_overflowing_tokens=True,
+                            # add_prefix_space=False,
+                        )
 
-                    self.assertEqual(len(truncated_sequence), len(sequence) - 2)
-                    self.assertEqual(truncated_sequence, truncated_longest_sequence)
+                    self.assertTrue(
+                        context.exception.args[0].startswith(
+                            "Not possible to return overflowing tokens for pair of sequences with the "
+                            "`longest_first`. Please select another truncation strategy than `longest_first`, "
+                            "for instance `only_second` or `only_first`."
+                        )
+                    )
 
-                    self.assertEqual(
-                        len(overflowing_tokens), 2 + stride
-                    )  # No overflowing tokens when using 'longest' in python tokenizers
-
-                information_first_truncated = tokenizer.encode_plus(
+                information_first_truncated = tokenizer(
                     seq_0,
                     seq_1,
                     max_length=len(sequence) - 2,
@@ -1138,7 +1197,7 @@ class TokenizerTesterMixin:
                     self.assertEqual(len(overflowing_tokens), 2 + stride)
                     self.assertEqual(overflowing_tokens, seq0_tokens[-(2 + stride) :])
 
-                information_second_truncated = tokenizer.encode_plus(
+                information_second_truncated = tokenizer(
                     seq_0,
                     seq_1,
                     max_length=len(sequence) - 2,
@@ -1400,6 +1459,25 @@ class TokenizerTesterMixin:
                         pad_to_multiple_of=8,
                     )
 
+    def test_padding_with_attention_mask(self):
+        tokenizers = self.get_tokenizers()
+        for tokenizer in tokenizers:
+            with self.subTest(f"{tokenizer.__class__.__name__}"):
+                if tokenizer.pad_token is None:
+                    self.skipTest("No padding token.")
+                if "attention_mask" not in tokenizer.model_input_names:
+                    self.skipTest("This model does not use attention mask.")
+
+                features = [
+                    {"input_ids": [1, 2, 3, 4, 5, 6], "attention_mask": [1, 1, 1, 1, 1, 0]},
+                    {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 0]},
+                ]
+                padded_features = tokenizer.pad(features)
+                if tokenizer.padding_side == "right":
+                    self.assertListEqual(padded_features["attention_mask"], [[1, 1, 1, 1, 1, 0], [1, 1, 0, 0, 0, 0]])
+                else:
+                    self.assertListEqual(padded_features["attention_mask"], [[1, 1, 1, 1, 1, 0], [0, 0, 0, 1, 1, 0]])
+
     def test_encode_plus_with_padding(self):
         tokenizers = self.get_tokenizers(do_lower_case=False)
         for tokenizer in tokenizers:
@@ -1625,6 +1703,34 @@ class TokenizerTesterMixin:
                         encoded_sequences_batch_padded_1[key],
                         encoded_sequences_batch_padded_2[key],
                     )
+
+    @require_tokenizers
+    def test_added_token_are_matched_longest_first(self):
+        if not self.test_slow_tokenizer:
+            self.skipTest("This test is only for slow tokenizers")
+            return
+        tokenizers = self.get_tokenizers(fast=False)
+        for tokenizer in tokenizers:
+            with self.subTest(f"{tokenizer.__class__.__name__}"):
+                try:
+                    tokenizer.add_tokens([AddedToken("extra_id_1")])
+                    tokenizer.add_tokens([AddedToken("extra_id_100")])
+                except Exception:
+                    # Canine cannot add tokens which are not codepoints
+                    self.skipTest("Cannot add those Added tokens")
+
+                # XXX: This used to split on `extra_id_1` first we're matching
+                # longest first now.
+                tokens = tokenizer.tokenize("This is some extra_id_100")
+                self.assertIn("extra_id_100", tokens)
+
+        for tokenizer in tokenizers:
+            with self.subTest(f"{tokenizer.__class__.__name__}"):
+                tokenizer.add_tokens([AddedToken("extra_id_100")])
+                tokenizer.add_tokens([AddedToken("extra_id_1")])
+
+                tokens = tokenizer.tokenize("This is some extra_id_100")
+                self.assertIn("extra_id_100", tokens)
 
     @require_tokenizers
     def test_added_token_serializable(self):
@@ -2462,6 +2568,10 @@ class TokenizerTesterMixin:
                 self.assertEqual(
                     tokenizer_r.add_special_tokens({"additional_special_tokens": ["<testtoken3>", "<testtoken4>"]}), 2
                 )
+                self.assertIn("<testtoken3>", tokenizer_r.special_tokens_map["additional_special_tokens"])
+                self.assertIsInstance(tokenizer_r.special_tokens_map["additional_special_tokens"], list)
+                self.assertGreaterEqual(len(tokenizer_r.special_tokens_map["additional_special_tokens"]), 2)
+
                 self.assertEqual(len(tokenizer_r), vocab_size + 8)
 
     def test_offsets_mapping(self):
@@ -3154,6 +3264,64 @@ class TokenizerTesterMixin:
                     self.assertTrue(special_token_id in p_output)
                     self.assertTrue(special_token_id in cr_output)
 
+    def test_special_tokens_initialization_with_non_empty_additional_special_tokens(self):
+        tokenizer_list = []
+        if self.test_slow_tokenizer:
+            tokenizer_list.append((self.tokenizer_class, self.get_tokenizer()))
+
+        if self.test_rust_tokenizer:
+            tokenizer_list.append((self.rust_tokenizer_class, self.get_rust_tokenizer()))
+
+        for tokenizer_class, tokenizer_utils in tokenizer_list:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tokenizer_utils.save_pretrained(tmp_dir)
+
+                with open(os.path.join(tmp_dir, "special_tokens_map.json"), encoding="utf-8") as json_file:
+                    special_tokens_map = json.load(json_file)
+
+                with open(os.path.join(tmp_dir, "tokenizer_config.json"), encoding="utf-8") as json_file:
+                    tokenizer_config = json.load(json_file)
+
+                special_tokens_map["additional_special_tokens"] = ["an_additional_special_token"]
+                tokenizer_config["additional_special_tokens"] = ["an_additional_special_token"]
+
+                with open(os.path.join(tmp_dir, "special_tokens_map.json"), "w", encoding="utf-8") as outfile:
+                    json.dump(special_tokens_map, outfile)
+                with open(os.path.join(tmp_dir, "tokenizer_config.json"), "w", encoding="utf-8") as outfile:
+                    json.dump(tokenizer_config, outfile)
+
+                # the following checks allow us to verify that our test works as expected, i.e. that the tokenizer takes
+                # into account the new value of additional_special_tokens given in the "tokenizer_config.json" and
+                # "special_tokens_map.json" files
+                tokenizer_without_change_in_init = tokenizer_class.from_pretrained(
+                    tmp_dir,
+                )
+                self.assertIn(
+                    "an_additional_special_token", tokenizer_without_change_in_init.additional_special_tokens
+                )
+                self.assertIn("an_additional_special_token", tokenizer_without_change_in_init.get_vocab())
+                self.assertEqual(
+                    ["an_additional_special_token"],
+                    tokenizer_without_change_in_init.convert_ids_to_tokens(
+                        tokenizer_without_change_in_init.convert_tokens_to_ids(["an_additional_special_token"])
+                    ),
+                )
+
+                # Now we test that we can change the value of additional_special_tokens in the from_pretrained
+                new_added_tokens = [AddedToken("a_new_additional_special_token", lstrip=True)]
+                tokenizer = tokenizer_class.from_pretrained(
+                    tmp_dir,
+                    additional_special_tokens=new_added_tokens,
+                )
+
+                self.assertIn("a_new_additional_special_token", tokenizer.additional_special_tokens)
+                self.assertEqual(
+                    ["a_new_additional_special_token"],
+                    tokenizer.convert_ids_to_tokens(
+                        tokenizer.convert_tokens_to_ids(["a_new_additional_special_token"])
+                    ),
+                )
+
     def test_training_new_tokenizer(self):
         # This feature only exists for fast tokenizers
         if not self.test_rust_tokenizer:
@@ -3288,6 +3456,62 @@ class TokenizerTesterMixin:
             expected_result = tokenizer.backend_tokenizer.normalizer.normalize_str(expected_result)
         self.assertEqual(expected_result, decoded_input)
 
+    def test_tokenizer_mismatch_warning(self):
+        for tokenizer, pretrained_name, kwargs in self.tokenizers_list:
+            with self.subTest(f"{tokenizer.__class__.__name__} ({pretrained_name})"):
+                with self.assertLogs("transformers", level="WARNING") as cm:
+                    try:
+                        if self.tokenizer_class == BertTokenizer:
+                            AlbertTokenizer.from_pretrained(pretrained_name)
+                        else:
+                            BertTokenizer.from_pretrained(pretrained_name)
+                    except (TypeError, AttributeError):
+                        # Some tokenizers cannot be loaded into the target tokenizer at all and errors are returned,
+                        # here we just check that the warning has been logged before the error is raised
+                        pass
+                    finally:
+                        self.assertTrue(
+                            cm.records[0].message.startswith(
+                                "The tokenizer class you load from this checkpoint is not the same type as the class this function is called from."
+                            )
+                        )
+                    try:
+                        if self.rust_tokenizer_class == BertTokenizerFast:
+                            AlbertTokenizerFast.from_pretrained(pretrained_name)
+                        else:
+                            BertTokenizerFast.from_pretrained(pretrained_name)
+                    except (TypeError, AttributeError):
+                        # Some tokenizers cannot be loaded into the target tokenizer at all and errors are returned,
+                        # here we just check that the warning has been logged before the error is raised
+                        pass
+                    finally:
+                        self.assertTrue(
+                            cm.records[0].message.startswith(
+                                "The tokenizer class you load from this checkpoint is not the same type as the class this function is called from."
+                            )
+                        )
+
+    @require_torch
+    def test_saving_tokenizer_trainer(self):
+        for tokenizer, pretrained_name, kwargs in self.tokenizers_list:
+            with self.subTest(f"{tokenizer.__class__.__name__} ({pretrained_name})"):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    # Save the fast tokenizer files in a temporary directory
+                    tokenizer_old = self.rust_tokenizer_class.from_pretrained(pretrained_name, **kwargs, use_fast=True)
+                    tokenizer_old.save_pretrained(tmp_dir, legacy_format=False)  # save only fast version
+
+                    # Initialize toy model for the trainer
+                    model = nn.Module()
+
+                    # Load tokenizer from a folder without legacy files
+                    tokenizer = self.rust_tokenizer_class.from_pretrained(tmp_dir)
+                    training_args = TrainingArguments(output_dir=tmp_dir, do_train=True, no_cuda=True)
+                    trainer = Trainer(model=model, args=training_args, tokenizer=tokenizer)
+
+                    # Should not raise an error
+                    trainer.save_model(os.path.join(tmp_dir, "checkpoint"))
+                    self.assertIn("tokenizer.json", os.listdir(os.path.join(tmp_dir, "checkpoint")))
+
 
 @is_staging_test
 class TokenizerPushToHubTester(unittest.TestCase):
@@ -3295,18 +3519,17 @@ class TokenizerPushToHubTester(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._api = HfApi(endpoint=ENDPOINT_STAGING)
-        cls._token = cls._api.login(username=USER, password=PASS)
+        cls._token = login(username=USER, password=PASS)
 
     @classmethod
     def tearDownClass(cls):
         try:
-            cls._api.delete_repo(token=cls._token, name="test-tokenizer")
+            delete_repo(token=cls._token, name="test-tokenizer")
         except HTTPError:
             pass
 
         try:
-            cls._api.delete_repo(token=cls._token, name="test-tokenizer-org", organization="valid_org")
+            delete_repo(token=cls._token, name="test-tokenizer-org", organization="valid_org")
         except HTTPError:
             pass
 
@@ -3338,3 +3561,54 @@ class TokenizerPushToHubTester(unittest.TestCase):
 
             new_tokenizer = BertTokenizer.from_pretrained("valid_org/test-tokenizer-org")
             self.assertDictEqual(new_tokenizer.vocab, tokenizer.vocab)
+
+
+class TrieTest(unittest.TestCase):
+    def test_trie(self):
+        trie = Trie()
+        trie.add("Hello 友達")
+        self.assertEqual(trie.data, {"H": {"e": {"l": {"l": {"o": {" ": {"友": {"達": {"": 1}}}}}}}}})
+        trie.add("Hello")
+        trie.data
+        self.assertEqual(trie.data, {"H": {"e": {"l": {"l": {"o": {"": 1, " ": {"友": {"達": {"": 1}}}}}}}}})
+
+    def test_trie_split(self):
+        trie = Trie()
+        self.assertEqual(trie.split("[CLS] This is a extra_id_100"), ["[CLS] This is a extra_id_100"])
+        trie.add("[CLS]")
+        trie.add("extra_id_1")
+        trie.add("extra_id_100")
+        self.assertEqual(trie.split("[CLS] This is a extra_id_100"), ["[CLS]", " This is a ", "extra_id_100"])
+
+    def test_trie_single(self):
+        trie = Trie()
+        trie.add("A")
+        self.assertEqual(trie.split("ABC"), ["A", "BC"])
+        self.assertEqual(trie.split("BCA"), ["BC", "A"])
+
+    def test_trie_final(self):
+        trie = Trie()
+        trie.add("TOKEN]")
+        trie.add("[SPECIAL_TOKEN]")
+        self.assertEqual(trie.split("This is something [SPECIAL_TOKEN]"), ["This is something ", "[SPECIAL_TOKEN]"])
+
+    def test_trie_subtokens(self):
+        trie = Trie()
+        trie.add("A")
+        trie.add("P")
+        trie.add("[SPECIAL_TOKEN]")
+        self.assertEqual(trie.split("This is something [SPECIAL_TOKEN]"), ["This is something ", "[SPECIAL_TOKEN]"])
+
+    def test_trie_suffix_tokens(self):
+        trie = Trie()
+        trie.add("AB")
+        trie.add("B")
+        trie.add("C")
+        self.assertEqual(trie.split("ABC"), ["AB", "C"])
+
+    def test_cut_text_hardening(self):
+        # Even if the offsets are wrong, we necessarily output correct string
+        # parts.
+        trie = Trie()
+        parts = trie.cut_text("ABC", [0, 0, 2, 1, 2, 3])
+        self.assertEqual(parts, ["AB", "C"])

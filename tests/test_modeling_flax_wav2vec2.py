@@ -187,7 +187,6 @@ class FlaxWav2Vec2ModelTest(FlaxModelTesterMixin, unittest.TestCase):
             expected_arg_names = ["input_values", "attention_mask"]
             self.assertListEqual(arg_names[:2], expected_arg_names)
 
-    @slow
     # overwrite because of `input_values`
     def test_jit_compilation(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
@@ -306,6 +305,48 @@ class FlaxWav2Vec2UtilsTest(unittest.TestCase):
         # => this means that `unique()` yields a single value for `hidden_size` dim
         self.assertTrue(np.unique(negatives, axis=-1).shape, (num_negatives, batch_size, sequence_length, 1))
 
+    def test_sample_negatives_with_attn_mask(self):
+        batch_size = 2
+        sequence_length = 10
+        hidden_size = 4
+        num_negatives = 3
+
+        features = (np.arange(sequence_length * hidden_size) // hidden_size).reshape(
+            sequence_length, hidden_size
+        )  # each value in vector consits of same value
+
+        # second half of last input tensor is padded
+        attention_mask = np.ones((batch_size, sequence_length), dtype=np.int8)
+        attention_mask[-1, sequence_length // 2 :] = 0
+
+        forbidden_indices = (
+            np.arange(sequence_length // 2, sequence_length, dtype=np.int32) + (batch_size - 1) * sequence_length
+        ).tolist()
+
+        features = np.broadcast_to(features[None, :], (batch_size, sequence_length, hidden_size))
+
+        negative_indices = _sample_negative_indices(features.shape, num_negatives, attention_mask=attention_mask)
+
+        # make sure that no padding tokens are sampled
+        self.assertTrue(all([idx not in negative_indices for idx in forbidden_indices]))
+
+        features = features.reshape(-1, hidden_size)  # BTC => (BxT)C
+        # take negative vectors from sampled indices
+        sampled_negatives = features[negative_indices.reshape(-1)]
+        negatives = sampled_negatives.reshape(batch_size, sequence_length, num_negatives, hidden_size).transpose(
+            2, 0, 1, 3
+        )
+
+        self.assertTrue(negatives.shape == (num_negatives, batch_size, sequence_length, hidden_size))
+
+        # make sure no negatively sampled vector is actually a positive one
+        for negative in negatives:
+            self.assertTrue(((negative - features.reshape(negative.shape)) == 0).sum() == 0.0)
+
+        # make sure that full vectors are sampled and not just slices of vectors
+        # => this means that `unique()` yields a single value for `hidden_size` dim
+        self.assertTrue(np.unique(negatives, axis=-1).shape, (num_negatives, batch_size, sequence_length, 1))
+
 
 @require_flax
 @require_datasets
@@ -315,21 +356,13 @@ class FlaxWav2Vec2ModelIntegrationTest(unittest.TestCase):
     def _load_datasamples(self, num_samples):
         from datasets import load_dataset
 
-        import soundfile as sf
+        ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+        # automatic decoding with librispeech
+        speech_samples = ds.sort("id").filter(
+            lambda x: x["id"] in [f"1272-141231-000{i}" for i in range(num_samples)]
+        )[:num_samples]["audio"]
 
-        ids = [f"1272-141231-000{i}" for i in range(num_samples)]
-
-        # map files to raw
-        def map_to_array(batch):
-            speech, _ = sf.read(batch["file"])
-            batch["speech"] = speech
-            return batch
-
-        ds = load_dataset("patrickvonplaten/librispeech_asr_dummy", "clean", split="validation")
-
-        ds = ds.filter(lambda x: x["id"] in ids).sort("id").map(map_to_array)
-
-        return ds["speech"][:num_samples]
+        return [x["array"] for x in speech_samples]
 
     def test_inference_ctc_robust_batched(self):
         model = FlaxWav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h-lv60-self", from_pt=True)

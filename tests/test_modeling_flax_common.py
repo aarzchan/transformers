@@ -22,20 +22,11 @@ from typing import List, Tuple
 import numpy as np
 
 import transformers
-from huggingface_hub import HfApi
+from huggingface_hub import delete_repo, login
 from requests.exceptions import HTTPError
 from transformers import BertConfig, is_flax_available, is_torch_available
 from transformers.models.auto import get_values
-from transformers.testing_utils import (
-    ENDPOINT_STAGING,
-    PASS,
-    USER,
-    CaptureLogger,
-    is_pt_flax_cross_test,
-    is_staging_test,
-    require_flax,
-    slow,
-)
+from transformers.testing_utils import PASS, USER, CaptureLogger, is_pt_flax_cross_test, is_staging_test, require_flax
 from transformers.utils import logging
 
 
@@ -44,13 +35,13 @@ if is_flax_available():
 
     import jax
     import jax.numpy as jnp
-    import jaxlib.xla_extension as jax_xla
     from flax.core.frozen_dict import unfreeze
     from flax.traverse_util import flatten_dict
     from transformers import (
         FLAX_MODEL_FOR_QUESTION_ANSWERING_MAPPING,
         FLAX_MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING,
         FLAX_MODEL_MAPPING,
+        FlaxAutoModel,
         FlaxAutoModelForSequenceClassification,
         FlaxBertModel,
     )
@@ -118,6 +109,7 @@ def random_attention_mask(shape, rng=None):
 class FlaxModelTesterMixin:
     model_tester = None
     all_model_classes = ()
+    test_mismatched_shapes = True
     is_encoder_decoder = False
 
     def _prepare_for_class(self, inputs_dict, model_class):
@@ -127,7 +119,7 @@ class FlaxModelTesterMixin:
         if "ForMultipleChoice" in model_class.__name__:
             inputs_dict = {
                 k: jnp.broadcast_to(v[:, None], (v.shape[0], self.model_tester.num_choices, v.shape[-1]))
-                if isinstance(v, (jax_xla.DeviceArray, np.ndarray))
+                if isinstance(v, (jnp.ndarray, np.ndarray))
                 else v
                 for k, v in inputs_dict.items()
             }
@@ -335,7 +327,63 @@ class FlaxModelTesterMixin:
                     max_diff = (base_params[key] - base_params_from_head[key]).sum().item()
                     self.assertLessEqual(max_diff, 1e-3, msg=f"{key} not identical")
 
-    @slow
+    @is_pt_flax_cross_test
+    def test_save_load_from_base_pt(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        base_class = FLAX_MODEL_MAPPING[config.__class__]
+
+        for model_class in self.all_model_classes:
+            if model_class == base_class:
+                continue
+
+            model = base_class(config)
+            base_params = flatten_dict(unfreeze(model.params))
+
+            # convert Flax model to PyTorch model
+            pt_model_class = getattr(transformers, base_class.__name__[4:])  # Skip the "Flax" at the beginning
+            pt_model = pt_model_class(config).eval()
+            pt_model = load_flax_weights_in_pytorch_model(pt_model, model.params)
+
+            # check that all base model weights are loaded correctly
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                # save pt model
+                pt_model.save_pretrained(tmpdirname)
+                head_model = model_class.from_pretrained(tmpdirname, from_pt=True)
+
+                base_param_from_head = flatten_dict(unfreeze(head_model.params[head_model.base_model_prefix]))
+
+                for key in base_param_from_head.keys():
+                    max_diff = (base_params[key] - base_param_from_head[key]).sum().item()
+                    self.assertLessEqual(max_diff, 1e-3, msg=f"{key} not identical")
+
+    @is_pt_flax_cross_test
+    def test_save_load_to_base_pt(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        base_class = FLAX_MODEL_MAPPING[config.__class__]
+
+        for model_class in self.all_model_classes:
+            if model_class == base_class:
+                continue
+
+            model = model_class(config)
+            base_params_from_head = flatten_dict(unfreeze(model.params[model.base_model_prefix]))
+
+            # convert Flax model to PyTorch model
+            pt_model_class = getattr(transformers, model_class.__name__[4:])  # Skip the "Flax" at the beginning
+            pt_model = pt_model_class(config).eval()
+            pt_model = load_flax_weights_in_pytorch_model(pt_model, model.params)
+
+            # check that all base model weights are loaded correctly
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                pt_model.save_pretrained(tmpdirname)
+                base_model = base_class.from_pretrained(tmpdirname, from_pt=True)
+
+                base_params = flatten_dict(unfreeze(base_model.params))
+
+                for key in base_params_from_head.keys():
+                    max_diff = (base_params[key] - base_params_from_head[key]).sum().item()
+                    self.assertLessEqual(max_diff, 1e-3, msg=f"{key} not identical")
+
     def test_jit_compilation(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
@@ -525,6 +573,8 @@ class FlaxModelTesterMixin:
             )
 
     def test_load_with_mismatched_shapes(self):
+        if not self.test_mismatched_shapes:
+            return
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
         for model_class in self.all_model_classes:
@@ -539,6 +589,8 @@ class FlaxModelTesterMixin:
                     # Fails when we don't set ignore_mismatched_sizes=True
                     with self.assertRaises(ValueError):
                         new_model = FlaxAutoModelForSequenceClassification.from_pretrained(tmp_dir, num_labels=42)
+                    with self.assertRaises(ValueError):
+                        new_model_without_prefix = FlaxAutoModel.from_pretrained(tmp_dir, vocab_size=10)
 
                     logger = logging.get_logger("transformers.modeling_flax_utils")
                     with CaptureLogger(logger) as cl:
@@ -550,24 +602,34 @@ class FlaxModelTesterMixin:
                     logits = new_model(**inputs_dict)["logits"]
                     self.assertEqual(logits.shape[1], 42)
 
+                    with CaptureLogger(logger) as cl:
+                        new_model_without_prefix = FlaxAutoModel.from_pretrained(
+                            tmp_dir, vocab_size=10, ignore_mismatched_sizes=True
+                        )
+                    self.assertIn("the shapes did not match", cl.out)
+                    input_ids = ids_tensor((2, 8), 10)
+                    if self.is_encoder_decoder:
+                        new_model_without_prefix(input_ids, decoder_input_ids=input_ids)
+                    else:
+                        new_model_without_prefix(input_ids)
+
 
 @require_flax
 @is_staging_test
 class FlaxModelPushToHubTester(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._api = HfApi(endpoint=ENDPOINT_STAGING)
-        cls._token = cls._api.login(username=USER, password=PASS)
+        cls._token = login(username=USER, password=PASS)
 
     @classmethod
     def tearDownClass(cls):
         try:
-            cls._api.delete_repo(token=cls._token, name="test-model-flax")
+            delete_repo(token=cls._token, name="test-model-flax")
         except HTTPError:
             pass
 
         try:
-            cls._api.delete_repo(token=cls._token, name="test-model-flax-org", organization="valid_org")
+            delete_repo(token=cls._token, name="test-model-flax-org", organization="valid_org")
         except HTTPError:
             pass
 

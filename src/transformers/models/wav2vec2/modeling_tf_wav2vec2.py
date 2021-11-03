@@ -1213,7 +1213,10 @@ class TFWav2Vec2MainLayer(tf.keras.layers.Layer):
         if inputs["attention_mask"] is not None:
             # compute real output lengths according to convolution formula
             output_lengths = self._get_feat_extract_output_lengths(tf.reduce_sum(inputs["attention_mask"], -1))
-            attention_mask = tf.sequence_mask(output_lengths, dtype=hidden_states.dtype)
+
+            attention_mask = tf.sequence_mask(
+                output_lengths, maxlen=shape_list(hidden_states)[1], dtype=hidden_states.dtype
+            )
 
         hidden_states = self.feature_projection(hidden_states, training=inputs["training"])
 
@@ -1403,7 +1406,7 @@ class TFWav2Vec2Model(TFWav2Vec2PreTrainedModel):
             >>>     batch["speech"] = speech
             >>>     return batch
 
-            >>> ds = load_dataset("patrickvonplaten/librispeech_asr_dummy", "clean", split="validation")
+            >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
             >>> ds = ds.map(map_to_array)
 
             >>> input_values = processor(ds["speech"][0], return_tensors="tf").input_values  # Batch size 1
@@ -1513,7 +1516,7 @@ class TFWav2Vec2ForCTC(TFWav2Vec2PreTrainedModel):
             >>>     batch["speech"] = speech
             >>>     return batch
 
-            >>> ds = load_dataset("patrickvonplaten/librispeech_asr_dummy", "clean", split="validation")
+            >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
             >>> ds = ds.map(map_to_array)
 
             >>> input_values = processor(ds["speech"][0], return_tensors="tf").input_values # Batch size 1
