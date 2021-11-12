@@ -22,7 +22,17 @@ from abc import abstractmethod
 from functools import lru_cache
 from unittest import skipIf
 
-from transformers import FEATURE_EXTRACTOR_MAPPING, TOKENIZER_MAPPING, AutoFeatureExtractor, AutoTokenizer, pipeline
+from transformers import (
+    FEATURE_EXTRACTOR_MAPPING,
+    TOKENIZER_MAPPING,
+    AutoFeatureExtractor,
+    AutoTokenizer,
+    IBertConfig,
+    RobertaConfig,
+    TextClassificationPipeline,
+    pipeline,
+)
+from transformers.pipelines import get_task
 from transformers.pipelines.base import _pad
 from transformers.testing_utils import is_pipeline_test, require_torch
 
@@ -143,7 +153,7 @@ class PipelineTestCaseMeta(type):
                     try:
                         tokenizer = get_tiny_tokenizer_from_checkpoint(checkpoint)
                         # XLNet actually defines it as -1.
-                        if model.config.__class__.__name__ == "RobertaConfig":
+                        if isinstance(model.config, (RobertaConfig, IBertConfig)):
                             tokenizer.model_max_length = model.config.max_position_embeddings - 2
                         elif (
                             hasattr(model.config, "max_position_embeddings")
@@ -252,6 +262,29 @@ class CommonPipelineTest(unittest.TestCase):
         dataset = MyDataset()
         for output in text_classifier(dataset):
             self.assertEqual(output, {"label": ANY(str), "score": ANY(float)})
+
+    @require_torch
+    def test_check_task_auto_inference(self):
+        pipe = pipeline(model="Narsil/tiny-distilbert-sequence-classification")
+
+        self.assertIsInstance(pipe, TextClassificationPipeline)
+
+    @require_torch
+    def test_pipeline_override(self):
+        class MyPipeline(TextClassificationPipeline):
+            pass
+
+        text_classifier = pipeline(model="Narsil/tiny-distilbert-sequence-classification", pipeline_class=MyPipeline)
+
+        self.assertIsInstance(text_classifier, MyPipeline)
+
+    def test_check_task(self):
+        task = get_task("gpt2")
+        self.assertEqual(task, "text-generation")
+
+        with self.assertRaises(RuntimeError):
+            # Wrong framework
+            get_task("espnet/siddhana_slurp_entity_asr_train_asr_conformer_raw_en_word_valid.acc.ave_10best")
 
 
 @is_pipeline_test
